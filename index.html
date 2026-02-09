@@ -46,12 +46,12 @@
       // mat4 identity
       id: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
 
-      // mat4 multiply: out = a * b
+      // mat4 multiply: out = a * b (column-major)
       mul: (a, b) => {
         const out = new Float32Array(16);
         for (let i = 0; i < 4; i++) {
           for (let j = 0; j < 4; j++) {
-            out[i*4+j] = a[i*4]*b[j] + a[i*4+1]*b[4+j] + a[i*4+2]*b[8+j] + a[i*4+3]*b[12+j];
+            out[j*4+i] = a[0*4+i]*b[j*4+0] + a[1*4+i]*b[j*4+1] + a[2*4+i]*b[j*4+2] + a[3*4+i]*b[j*4+3];
           }
         }
         return out;
@@ -185,7 +185,7 @@
         vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
         vec3 normal = normalize(vNormal);
         float diff = max(dot(normal, lightDir), 0.0);
-        float ambient = 0.3;
+        float ambient = 0.45;
         vec3 color = uColor * (ambient + diff * 0.7);
 
         // Portal glow effect (not used yet)
@@ -314,6 +314,72 @@
       return { positions, normals, indices };
     };
 
+    // Build room geometry with individual faces based on flags bitmask
+    // Flags: bit 0=front(+Z), 1=back(-Z), 2=top(+Y), 3=bottom(-Y), 4=right(+X), 5=left(-X)
+    const buildRoomGeometry = (w, h, d, flags) => {
+      const hw = w/2, hh = h/2, hd = d/2;
+      const positions = [];
+      const normals = [];
+      const indices = [];
+      let vertexOffset = 0;
+
+      const addFace = (verts, norm) => {
+        positions.push(...verts);
+        normals.push(norm[0], norm[1], norm[2], norm[0], norm[1], norm[2], norm[0], norm[1], norm[2], norm[0], norm[1], norm[2]);
+        // Two triangles (inverted winding for inward faces)
+        indices.push(vertexOffset+2, vertexOffset+1, vertexOffset, vertexOffset+3, vertexOffset+2, vertexOffset);
+        vertexOffset += 4;
+      };
+
+      // Front face (+Z) - bit 0
+      if (flags & 0b000001) {
+        addFace([
+          -hw, -hh, hd,  hw, -hh, hd,  hw, hh, hd, -hw, hh, hd
+        ], [0, 0, -1]);
+      }
+
+      // Back face (-Z) - bit 1
+      if (flags & 0b000010) {
+        addFace([
+          hw, -hh, -hd, -hw, -hh, -hd, -hw, hh, -hd,  hw, hh, -hd
+        ], [0, 0, 1]);
+      }
+
+      // Top face (+Y) - bit 2
+      if (flags & 0b000100) {
+        addFace([
+          -hw, hh, hd,  hw, hh, hd,  hw, hh, -hd, -hw, hh, -hd
+        ], [0, -1, 0]);
+      }
+
+      // Bottom face (-Y) - bit 3
+      if (flags & 0b001000) {
+        addFace([
+          -hw, -hh, -hd,  hw, -hh, -hd,  hw, -hh, hd, -hw, -hh, hd
+        ], [0, 1, 0]);
+      }
+
+      // Right face (+X) - bit 4
+      if (flags & 0b010000) {
+        addFace([
+          hw, -hh, hd,  hw, -hh, -hd,  hw, hh, -hd,  hw, hh, hd
+        ], [-1, 0, 0]);
+      }
+
+      // Left face (-X) - bit 5
+      if (flags & 0b100000) {
+        addFace([
+          -hw, -hh, -hd, -hw, -hh, hd, -hw, hh, hd, -hw, hh, -hd
+        ], [1, 0, 0]);
+      }
+
+      return {
+        positions: new Float32Array(positions),
+        normals: new Float32Array(normals),
+        indices: new Uint16Array(indices)
+      };
+    };
+
     // === GEOMETRY BUFFER MANAGEMENT ===
     const createBuffers = (geom) => {
       const posBuffer = gl.createBuffer();
@@ -339,9 +405,10 @@
     // === LEVEL BUILDING ===
     const LEVEL_1 = [
       // [x, y, z, w, h, d, color, flags]
-      [0, 0, 0, 10, 4, 10, [0.9, 0.9, 0.9], 0b111111],
-      [10, 0, 0, 8, 4, 12, [0.85, 0.85, 0.88], 0b110111], // right wall open
-      [-10, 0, 0, 6, 4, 8, [0.88, 0.88, 0.9], 0b101111]   // left wall open
+      // Flags: bit 0=front(+Z), 1=back(-Z), 2=top(+Y), 3=bottom(-Y), 4=right(+X), 5=left(-X)
+      [0, 0, 0, 10, 4, 10, [0.9, 0.9, 0.9], 0b101111],      // right wall open (bit 4 = 0)
+      [9, 0, 0, 8, 4, 12, [0.85, 0.85, 0.88], 0b011111],    // left wall open (bit 5 = 0)
+      [-8, 0, 0, 6, 4, 8, [0.88, 0.88, 0.9], 0b101111]      // right wall open (bit 4 = 0)
     ];
 
     const levelGeometry = [];
@@ -350,13 +417,14 @@
       for (const room of data) {
         const [x, y, z, w, h, d, color, flags] = room;
 
-        // Create inverted box for room
-        const geom = createBox(w, h, d, true);
+        // Build room with individual faces based on flags
+        const geom = buildRoomGeometry(w, h, d, flags);
         const buffers = createBuffers(geom);
 
+        // Offset Y by +h/2 so floor sits at specified Y coordinate
         levelGeometry.push({
           buffers,
-          pos: [x, y, z],
+          pos: [x, y + h/2, z],
           color,
           glow: 0
         });
