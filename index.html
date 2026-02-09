@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Portal Clone</title>
+  <style>
+    * { margin: 0; padding: 0; overflow: hidden; }
+    body { width: 100vw; height: 100vh; background: #000; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #crosshair {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      width: 20px;
+      height: 20px;
+      margin: -10px 0 0 -10px;
+      pointer-events: none;
+    }
+    #crosshair::before, #crosshair::after {
+      content: '';
+      position: absolute;
+      background: rgba(255, 255, 255, 0.8);
+    }
+    #crosshair::before {
+      left: 9px;
+      top: 3px;
+      width: 2px;
+      height: 14px;
+    }
+    #crosshair::after {
+      left: 3px;
+      top: 9px;
+      width: 14px;
+      height: 2px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="crosshair"></div>
+  <script>
+    'use strict';
+
+    // === MATH UTILITIES ===
+    const M = {
+      // mat4 identity
+      id: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+
+      // mat4 multiply: out = a * b
+      mul: (a, b) => {
+        const out = new Float32Array(16);
+        for (let i = 0; i < 4; i++) {
+          for (let j = 0; j < 4; j++) {
+            out[i*4+j] = a[i*4]*b[j] + a[i*4+1]*b[4+j] + a[i*4+2]*b[8+j] + a[i*4+3]*b[12+j];
+          }
+        }
+        return out;
+      },
+
+      // mat4 perspective projection
+      persp: (fov, aspect, near, far) => {
+        const f = 1 / Math.tan(fov / 2);
+        const nf = 1 / (near - far);
+        return new Float32Array([
+          f/aspect, 0, 0, 0,
+          0, f, 0, 0,
+          0, 0, (far+near)*nf, -1,
+          0, 0, 2*far*near*nf, 0
+        ]);
+      },
+
+      // mat4 lookAt view matrix
+      lookAt: (eye, target, up) => {
+        const z = V.norm(V.sub(eye, target));
+        const x = V.norm(V.cross(up, z));
+        const y = V.cross(z, x);
+        return new Float32Array([
+          x[0], y[0], z[0], 0,
+          x[1], y[1], z[1], 0,
+          x[2], y[2], z[2], 0,
+          -V.dot(x,eye), -V.dot(y,eye), -V.dot(z,eye), 1
+        ]);
+      },
+
+      // mat4 translate
+      trans: (x, y, z) => new Float32Array([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        x, y, z, 1
+      ]),
+
+      // mat4 rotate X
+      rotX: (a) => {
+        const c = Math.cos(a), s = Math.sin(a);
+        return new Float32Array([
+          1, 0, 0, 0,
+          0, c, s, 0,
+          0, -s, c, 0,
+          0, 0, 0, 1
+        ]);
+      },
+
+      // mat4 rotate Y
+      rotY: (a) => {
+        const c = Math.cos(a), s = Math.sin(a);
+        return new Float32Array([
+          c, 0, -s, 0,
+          0, 1, 0, 0,
+          s, 0, c, 0,
+          0, 0, 0, 1
+        ]);
+      },
+
+      // mat4 rotate Z
+      rotZ: (a) => {
+        const c = Math.cos(a), s = Math.sin(a);
+        return new Float32Array([
+          c, s, 0, 0,
+          -s, c, 0, 0,
+          0, 0, 1, 0,
+          0, 0, 0, 1
+        ]);
+      }
+    };
+
+    // vec3 operations
+    const V = {
+      add: (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]],
+      sub: (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]],
+      scale: (v, s) => [v[0]*s, v[1]*s, v[2]*s],
+      dot: (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2],
+      cross: (a, b) => [
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0]
+      ],
+      len: (v) => Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]),
+      norm: (v) => {
+        const l = V.len(v);
+        return l > 0 ? [v[0]/l, v[1]/l, v[2]/l] : [0,0,0];
+      }
+    };
+
+    // === WEBGL SETUP ===
+    const canvas = document.getElementById('c');
+    const gl = canvas.getContext('webgl');
+
+    if (!gl) {
+      alert('WebGL not supported');
+      throw new Error('WebGL not supported');
+    }
+
+    // Resize canvas to match display size
+    const resize = () => {
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    // === SHADER COMPILATION ===
+    const vertShader = `
+      attribute vec3 aPosition;
+      attribute vec3 aNormal;
+      uniform mat4 uMVP;
+      uniform mat4 uModel;
+      varying vec3 vNormal;
+      varying vec3 vPos;
+      void main() {
+        gl_Position = uMVP * vec4(aPosition, 1.0);
+        vNormal = (uModel * vec4(aNormal, 0.0)).xyz;
+        vPos = (uModel * vec4(aPosition, 1.0)).xyz;
+      }
+    `;
+
+    const fragShader = `
+      precision mediump float;
+      uniform vec3 uColor;
+      uniform float uPortalGlow;
+      varying vec3 vNormal;
+      varying vec3 vPos;
+      void main() {
+        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+        vec3 normal = normalize(vNormal);
+        float diff = max(dot(normal, lightDir), 0.0);
+        float ambient = 0.3;
+        vec3 color = uColor * (ambient + diff * 0.7);
+
+        // Portal glow effect (not used yet)
+        if (uPortalGlow > 0.0) {
+          color += vec3(1.0, 0.5, 0.0) * uPortalGlow;
+        }
+
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `;
+
+    const compileShader = (src, type) => {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, src);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    };
+
+    const vs = compileShader(vertShader, gl.VERTEX_SHADER);
+    const fs = compileShader(fragShader, gl.FRAGMENT_SHADER);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.error('Program link error:', gl.getProgramInfoLog(prog));
+    }
+
+    gl.useProgram(prog);
+
+    // Get attribute/uniform locations
+    const aPos = gl.getAttribLocation(prog, 'aPosition');
+    const aNorm = gl.getAttribLocation(prog, 'aNormal');
+    const uMVP = gl.getUniformLocation(prog, 'uMVP');
+    const uModel = gl.getUniformLocation(prog, 'uModel');
+    const uColor = gl.getUniformLocation(prog, 'uColor');
+    const uPortalGlow = gl.getUniformLocation(prog, 'uPortalGlow');
+
+    // Enable depth test and backface culling
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK);
+
+    // === PROCEDURAL GEOMETRY ===
+    const createBox = (w, h, d, invert = false) => {
+      const hw = w/2, hh = h/2, hd = d/2;
+      const s = invert ? -1 : 1;
+
+      const positions = new Float32Array([
+        // Front
+        -hw, -hh,  hd,  hw, -hh,  hd,  hw,  hh,  hd, -hw,  hh,  hd,
+        // Back
+         hw, -hh, -hd, -hw, -hh, -hd, -hw,  hh, -hd,  hw,  hh, -hd,
+        // Top
+        -hw,  hh,  hd,  hw,  hh,  hd,  hw,  hh, -hd, -hw,  hh, -hd,
+        // Bottom
+        -hw, -hh, -hd,  hw, -hh, -hd,  hw, -hh,  hd, -hw, -hh,  hd,
+        // Right
+         hw, -hh,  hd,  hw, -hh, -hd,  hw,  hh, -hd,  hw,  hh,  hd,
+        // Left
+        -hw, -hh, -hd, -hw, -hh,  hd, -hw,  hh,  hd, -hw,  hh, -hd
+      ]);
+
+      const normals = new Float32Array([
+        // Front
+        0,0,s*1, 0,0,s*1, 0,0,s*1, 0,0,s*1,
+        // Back
+        0,0,s*-1, 0,0,s*-1, 0,0,s*-1, 0,0,s*-1,
+        // Top
+        0,s*1,0, 0,s*1,0, 0,s*1,0, 0,s*1,0,
+        // Bottom
+        0,s*-1,0, 0,s*-1,0, 0,s*-1,0, 0,s*-1,0,
+        // Right
+        s*1,0,0, s*1,0,0, s*1,0,0, s*1,0,0,
+        // Left
+        s*-1,0,0, s*-1,0,0, s*-1,0,0, s*-1,0,0
+      ]);
+
+      const indices = new Uint16Array([
+        0,1,2, 0,2,3,       // Front
+        4,5,6, 4,6,7,       // Back
+        8,9,10, 8,10,11,    // Top
+        12,13,14, 12,14,15, // Bottom
+        16,17,18, 16,18,19, // Right
+        20,21,22, 20,22,23  // Left
+      ]);
+
+      if (invert) {
+        // Reverse winding order for inverted box
+        for (let i = 0; i < indices.length; i += 3) {
+          const tmp = indices[i];
+          indices[i] = indices[i+2];
+          indices[i+2] = tmp;
+        }
+      }
+
+      return { positions, normals, indices };
+    };
+
+    const createPlane = (w, h, nx, ny, nz) => {
+      const hw = w/2, hh = h/2;
+      // Create a plane facing in the direction of the normal
+      // For simplicity, assume plane is XY and normal is Z
+      const positions = new Float32Array([
+        -hw, -hh, 0,
+         hw, -hh, 0,
+         hw,  hh, 0,
+        -hw,  hh, 0
+      ]);
+
+      const normals = new Float32Array([
+        nx, ny, nz,
+        nx, ny, nz,
+        nx, ny, nz,
+        nx, ny, nz
+      ]);
+
+      const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+      return { positions, normals, indices };
+    };
+
+    // === GEOMETRY BUFFER MANAGEMENT ===
+    const createBuffers = (geom) => {
+      const posBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, geom.positions, gl.STATIC_DRAW);
+
+      const normBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, normBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, geom.normals, gl.STATIC_DRAW);
+
+      const idxBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, geom.indices, gl.STATIC_DRAW);
+
+      return {
+        pos: posBuffer,
+        norm: normBuffer,
+        idx: idxBuffer,
+        count: geom.indices.length
+      };
+    };
+
+    // === LEVEL BUILDING ===
+    const LEVEL_1 = [
+      // [x, y, z, w, h, d, color, flags]
+      [0, 0, 0, 10, 4, 10, [0.9, 0.9, 0.9], 0b111111],
+      [10, 0, 0, 8, 4, 12, [0.85, 0.85, 0.88], 0b110111], // right wall open
+      [-10, 0, 0, 6, 4, 8, [0.88, 0.88, 0.9], 0b101111]   // left wall open
+    ];
+
+    const levelGeometry = [];
+
+    const buildLevel = (data) => {
+      for (const room of data) {
+        const [x, y, z, w, h, d, color, flags] = room;
+
+        // Create inverted box for room
+        const geom = createBox(w, h, d, true);
+        const buffers = createBuffers(geom);
+
+        levelGeometry.push({
+          buffers,
+          pos: [x, y, z],
+          color,
+          glow: 0
+        });
+      }
+    };
+
+    buildLevel(LEVEL_1);
+
+    // === CAMERA & CONTROLS ===
+    const cam = {
+      pos: [0, 1, 5],
+      pitch: 0,  // radians
+      yaw: 0,    // radians
+      fov: 70 * Math.PI / 180
+    };
+
+    const keys = {};
+    const mouse = { dx: 0, dy: 0 };
+    let pointerLocked = false;
+
+    // Keyboard input
+    window.addEventListener('keydown', e => keys[e.code] = true);
+    window.addEventListener('keyup', e => keys[e.code] = false);
+
+    // Pointer lock
+    canvas.addEventListener('click', () => {
+      if (!pointerLocked) {
+        canvas.requestPointerLock();
+      }
+    });
+
+    document.addEventListener('pointerlockchange', () => {
+      pointerLocked = document.pointerLockElement === canvas;
+    });
+
+    // Mouse movement
+    document.addEventListener('mousemove', e => {
+      if (pointerLocked) {
+        mouse.dx = e.movementX;
+        mouse.dy = e.movementY;
+      }
+    });
+
+    // Mouse buttons
+    canvas.addEventListener('mousedown', e => {
+      if (pointerLocked) {
+        if (e.button === 0) {
+          console.log('Fire blue portal');
+        } else if (e.button === 2) {
+          console.log('Fire orange portal');
+        }
+      }
+    });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    // === PHYSICS ===
+    const player = {
+      w: 0.6,
+      h: 1.8,
+      d: 0.6,
+      vel: [0, 0, 0],
+      grounded: false
+    };
+
+    const GRAVITY = 9.8;
+    const MOVE_SPEED = 5;
+    const JUMP_VEL = 5;
+
+    const updatePhysics = (dt) => {
+      // Apply gravity
+      if (!player.grounded) {
+        player.vel[1] -= GRAVITY * dt;
+      }
+
+      // Update position
+      cam.pos[0] += player.vel[0] * dt;
+      cam.pos[1] += player.vel[1] * dt;
+      cam.pos[2] += player.vel[2] * dt;
+
+      // Ground collision (simple floor at y=0)
+      const groundY = player.h / 2;
+      if (cam.pos[1] < groundY) {
+        cam.pos[1] = groundY;
+        player.vel[1] = 0;
+        player.grounded = true;
+      } else if (cam.pos[1] > groundY + 0.1) {
+        player.grounded = false;
+      }
+
+      // Simple wall collision - keep player within bounds
+      const bounds = 20;
+      if (Math.abs(cam.pos[0]) > bounds) {
+        cam.pos[0] = Math.sign(cam.pos[0]) * bounds;
+        player.vel[0] = 0;
+      }
+      if (Math.abs(cam.pos[2]) > bounds) {
+        cam.pos[2] = Math.sign(cam.pos[2]) * bounds;
+        player.vel[2] = 0;
+      }
+    };
+
+    // === INPUT HANDLING ===
+    const handleInput = (dt) => {
+      // Mouse look
+      const sensitivity = 0.002;
+      cam.yaw -= mouse.dx * sensitivity;
+      cam.pitch -= mouse.dy * sensitivity;
+
+      // Clamp pitch
+      const maxPitch = 89 * Math.PI / 180;
+      cam.pitch = Math.max(-maxPitch, Math.min(maxPitch, cam.pitch));
+
+      mouse.dx = 0;
+      mouse.dy = 0;
+
+      // Movement
+      const forward = [
+        -Math.sin(cam.yaw),
+        0,
+        -Math.cos(cam.yaw)
+      ];
+      const right = [
+        Math.cos(cam.yaw),
+        0,
+        -Math.sin(cam.yaw)
+      ];
+
+      let moveX = 0, moveZ = 0;
+
+      if (keys['KeyW']) {
+        moveX += forward[0];
+        moveZ += forward[2];
+      }
+      if (keys['KeyS']) {
+        moveX -= forward[0];
+        moveZ -= forward[2];
+      }
+      if (keys['KeyD']) {
+        moveX += right[0];
+        moveZ += right[2];
+      }
+      if (keys['KeyA']) {
+        moveX -= right[0];
+        moveZ -= right[2];
+      }
+
+      // Normalize movement
+      const moveLen = Math.sqrt(moveX*moveX + moveZ*moveZ);
+      if (moveLen > 0) {
+        moveX /= moveLen;
+        moveZ /= moveLen;
+      }
+
+      player.vel[0] = moveX * MOVE_SPEED;
+      player.vel[2] = moveZ * MOVE_SPEED;
+
+      // Jump
+      if (keys['Space'] && player.grounded) {
+        player.vel[1] = JUMP_VEL;
+        player.grounded = false;
+      }
+    };
+
+    // === PORTAL UPDATE (STUB) ===
+    const updatePortals = () => {
+      // Placeholder for portal logic
+    };
+
+    // === RENDERING ===
+    const render = () => {
+      // Clear
+      gl.clearColor(0.2, 0.2, 0.2, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      // Projection matrix
+      const aspect = canvas.width / canvas.height;
+      const proj = M.persp(cam.fov, aspect, 0.1, 100);
+
+      // View matrix
+      const camDir = [
+        Math.cos(cam.pitch) * -Math.sin(cam.yaw),
+        Math.sin(cam.pitch),
+        Math.cos(cam.pitch) * -Math.cos(cam.yaw)
+      ];
+      const target = V.add(cam.pos, camDir);
+      const view = M.lookAt(cam.pos, target, [0, 1, 0]);
+
+      const vp = M.mul(proj, view);
+
+      // Draw level geometry
+      for (const obj of levelGeometry) {
+        const model = M.trans(obj.pos[0], obj.pos[1], obj.pos[2]);
+        const mvp = M.mul(vp, model);
+
+        // Bind buffers
+        gl.bindBuffer(gl.ARRAY_BUFFER, obj.buffers.pos);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, obj.buffers.norm);
+        gl.enableVertexAttribArray(aNorm);
+        gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.buffers.idx);
+
+        // Set uniforms
+        gl.uniformMatrix4fv(uMVP, false, mvp);
+        gl.uniformMatrix4fv(uModel, false, model);
+        gl.uniform3fv(uColor, obj.color);
+        gl.uniform1f(uPortalGlow, obj.glow);
+
+        // Draw
+        gl.drawElements(gl.TRIANGLES, obj.buffers.count, gl.UNSIGNED_SHORT, 0);
+      }
+    };
+
+    // === GAME LOOP ===
+    let lastT = 0;
+    const frame = (t) => {
+      const dt = Math.min((t - lastT) / 1000, 0.1); // Cap dt to 100ms
+      lastT = t;
+
+      handleInput(dt);
+      updatePhysics(dt);
+      updatePortals();
+      render();
+
+      requestAnimationFrame(frame);
+    };
+
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
