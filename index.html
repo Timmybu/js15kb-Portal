@@ -144,7 +144,7 @@
 
     // === WEBGL SETUP ===
     const canvas = document.getElementById('c');
-    const gl = canvas.getContext('webgl');
+    const gl = canvas.getContext('webgl', { stencil: true });
 
     if (!gl) {
       alert('WebGL not supported');
@@ -412,26 +412,146 @@
     ];
 
     const levelGeometry = [];
+    const levelFaces = [];
+    const portals = { blue: null, orange: null };
+    let portalMesh = null;
 
     const buildLevel = (data) => {
-      for (const room of data) {
-        const [x, y, z, w, h, d, color, flags] = room;
+      for (let roomIdx = 0; roomIdx < data.length; roomIdx++) {
+        const [x, y, z, w, h, d, color, flags] = data[roomIdx];
+        const hw = w/2, hh = h/2, hd = d/2;
 
         // Build room with individual faces based on flags
         const geom = buildRoomGeometry(w, h, d, flags);
         const buffers = createBuffers(geom);
 
         // Offset Y by +h/2 so floor sits at specified Y coordinate
+        const roomPos = [x, y + h/2, z];
         levelGeometry.push({
           buffers,
-          pos: [x, y + h/2, z],
+          pos: roomPos,
           color,
           glow: 0
         });
+
+        // Track individual faces for raycasting
+        // Face format: [faceType, normal, planeAxis, planeValue, axis1Idx, axis2Idx, bounds, eligible]
+        const faceData = [
+          [0, [0,0,-1], 2, z+hd, 0, 1, [[x-hw,x+hw], [y,y+h]], (flags&1)>0],  // Front +Z
+          [1, [0,0,1],  2, z-hd, 0, 1, [[x-hw,x+hw], [y,y+h]], (flags&2)>0],  // Back -Z
+          [2, [0,-1,0], 1, y+h,  0, 2, [[x-hw,x+hw], [z-hd,z+hd]], false],    // Top +Y (ceiling)
+          [3, [0,1,0],  1, y,    0, 2, [[x-hw,x+hw], [z-hd,z+hd]], (flags&8)>0], // Bottom -Y (floor)
+          [4, [-1,0,0], 0, x+hw, 1, 2, [[y,y+h], [z-hd,z+hd]], (flags&16)>0], // Right +X
+          [5, [1,0,0],  0, x-hw, 1, 2, [[y,y+h], [z-hd,z+hd]], (flags&32)>0]  // Left -X
+        ];
+
+        for (const [faceType, normal, planeAxis, planeValue, axis1Idx, axis2Idx, bounds, eligible] of faceData) {
+          if (eligible) {
+            // Compute face center in world space
+            const centerCoords = [x, y + h/2, z];
+            centerCoords[planeAxis] = planeValue;
+
+            levelFaces.push({
+              roomIdx,
+              faceType,
+              center: centerCoords,
+              normal,
+              planeAxis,
+              planeValue,
+              axis1Idx,
+              axis2Idx,
+              bounds: { axis1: bounds[0], axis2: bounds[1] },
+              eligible: true
+            });
+          }
+        }
       }
     };
 
     buildLevel(LEVEL_1);
+    console.log('Level faces tracked:', levelFaces.length);
+
+    // === RAYCASTING ===
+    const raycast = (origin, dir) => {
+      let closestHit = null;
+      let minT = 50; // Max range
+
+      for (let i = 0; i < levelFaces.length; i++) {
+        const face = levelFaces[i];
+        if (!face.eligible) continue;
+
+        // Ray-plane intersection for axis-aligned plane
+        const denom = dir[face.planeAxis];
+        if (Math.abs(denom) < 0.0001) continue; // Parallel to plane
+
+        const t = (face.planeValue - origin[face.planeAxis]) / denom;
+        if (t < 0.01 || t >= minT) continue; // Behind camera or too far
+
+        // Compute hit point
+        const hit = [
+          origin[0] + dir[0] * t,
+          origin[1] + dir[1] * t,
+          origin[2] + dir[2] * t
+        ];
+
+        // Check bounds on the two tangent axes
+        const u = hit[face.axis1Idx];
+        const v = hit[face.axis2Idx];
+
+        if (u >= face.bounds.axis1[0] && u <= face.bounds.axis1[1] &&
+            v >= face.bounds.axis2[0] && v <= face.bounds.axis2[1]) {
+          minT = t;
+          closestHit = {
+            point: hit,
+            normal: face.normal,
+            faceIdx: i,
+            t: t
+          };
+        }
+      }
+
+      return closestHit;
+    };
+
+    // === PORTAL GEOMETRY ===
+    const createPortalMesh = () => {
+      const segments = 16;
+      const w = 1.2; // Portal width
+      const h = 2.0; // Portal height
+
+      const positions = [0, 0, 0]; // Center vertex
+      const normals = [];
+      const indices = [];
+
+      // Fill normals for center
+      for (let i = 0; i <= segments + 1; i++) {
+        normals.push(0, 0, 1);
+      }
+
+      // Generate oval ring
+      for (let i = 0; i <= segments; i++) {
+        const angle = (i / segments) * Math.PI * 2;
+        positions.push(
+          Math.cos(angle) * w/2,
+          Math.sin(angle) * h/2,
+          0
+        );
+      }
+
+      // Triangle fan indices
+      for (let i = 1; i <= segments; i++) {
+        indices.push(0, i, i + 1);
+      }
+
+      return createBuffers({
+        positions: new Float32Array(positions),
+        normals: new Float32Array(normals),
+        indices: new Uint16Array(indices)
+      });
+    };
+
+    // Initialize portal mesh
+    portalMesh = createPortalMesh();
 
     // === CAMERA & CONTROLS ===
     const cam = {
@@ -468,13 +588,60 @@
       }
     });
 
-    // Mouse buttons
+    // Mouse buttons - Portal placement
     canvas.addEventListener('mousedown', e => {
       if (pointerLocked) {
-        if (e.button === 0) {
-          console.log('Fire blue portal');
-        } else if (e.button === 2) {
-          console.log('Fire orange portal');
+        // Compute camera direction
+        const camDir = [
+          Math.cos(cam.pitch) * -Math.sin(cam.yaw),
+          Math.sin(cam.pitch),
+          Math.cos(cam.pitch) * -Math.cos(cam.yaw)
+        ];
+
+        // Raycast to find wall hit
+        const hit = raycast(cam.pos, camDir);
+
+        if (hit) {
+          const face = levelFaces[hit.faceIdx];
+
+          // Compute portal frame (up and right vectors)
+          let up, right;
+          if (Math.abs(face.normal[1]) < 0.9) {
+            // Wall portal (normal mostly horizontal)
+            up = [0, 1, 0];
+            right = V.norm(V.cross(up, face.normal));
+          } else {
+            // Floor portal (normal is [0,±1,0])
+            // Orient up based on camera forward projection
+            const camFwd = [
+              -Math.sin(cam.yaw),
+              0,
+              -Math.cos(cam.yaw)
+            ];
+            up = V.norm(camFwd);
+            right = V.norm(V.cross(up, face.normal));
+            up = V.cross(face.normal, right); // Recompute for orthogonality
+          }
+
+          // Offset position slightly to avoid z-fighting
+          const pos = V.add(hit.point, V.scale(face.normal, 0.01));
+
+          const portal = {
+            pos,
+            normal: face.normal,
+            up,
+            right,
+            faceIdx: hit.faceIdx,
+            active: true
+          };
+
+          if (e.button === 0) {
+            portals.blue = portal;
+            console.log('Blue portal placed at', pos);
+          } else if (e.button === 2) {
+            portals.orange = portal;
+            console.log('Orange portal placed at', pos);
+          }
         }
       }
     });
@@ -593,33 +760,26 @@
       // Placeholder for portal logic
     };
 
-    // === RENDERING ===
-    const render = () => {
-      // Clear
-      gl.clearColor(0.2, 0.2, 0.2, 1);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    // === HELPER FUNCTIONS ===
+    const getCamDir = () => [
+      Math.cos(cam.pitch) * -Math.sin(cam.yaw),
+      Math.sin(cam.pitch),
+      Math.cos(cam.pitch) * -Math.cos(cam.yaw)
+    ];
 
-      // Projection matrix
-      const aspect = canvas.width / canvas.height;
-      const proj = M.persp(cam.fov, aspect, 0.1, 100);
-
-      // View matrix
-      const camDir = [
-        Math.cos(cam.pitch) * -Math.sin(cam.yaw),
-        Math.sin(cam.pitch),
-        Math.cos(cam.pitch) * -Math.cos(cam.yaw)
-      ];
+    const getViewMatrix = () => {
+      const camDir = getCamDir();
       const target = V.add(cam.pos, camDir);
-      const view = M.lookAt(cam.pos, target, [0, 1, 0]);
+      return M.lookAt(cam.pos, target, [0, 1, 0]);
+    };
 
+    const drawScene = (proj, view) => {
       const vp = M.mul(proj, view);
 
-      // Draw level geometry
       for (const obj of levelGeometry) {
         const model = M.trans(obj.pos[0], obj.pos[1], obj.pos[2]);
         const mvp = M.mul(vp, model);
 
-        // Bind buffers
         gl.bindBuffer(gl.ARRAY_BUFFER, obj.buffers.pos);
         gl.enableVertexAttribArray(aPos);
         gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
@@ -630,14 +790,163 @@
 
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.buffers.idx);
 
-        // Set uniforms
         gl.uniformMatrix4fv(uMVP, false, mvp);
         gl.uniformMatrix4fv(uModel, false, model);
         gl.uniform3fv(uColor, obj.color);
         gl.uniform1f(uPortalGlow, obj.glow);
 
-        // Draw
         gl.drawElements(gl.TRIANGLES, obj.buffers.count, gl.UNSIGNED_SHORT, 0);
+      }
+    };
+
+    // === PORTAL RENDERING ===
+    const computePortalView = (portalA, portalB, camPos, camDir) => {
+      // Transform camera from portal A's frame to portal B's frame
+      const offset = V.sub(camPos, portalA.pos);
+      const localX = V.dot(offset, portalA.right);
+      const localY = V.dot(offset, portalA.up);
+      const localZ = V.dot(offset, portalA.normal);
+
+      // Apply to portal B with 180° rotation (flip X and Z)
+      const virtualPos = V.add(portalB.pos,
+        V.add(V.scale(portalB.right, -localX),
+        V.add(V.scale(portalB.up, localY),
+              V.scale(portalB.normal, -localZ)))
+      );
+
+      // Transform camera direction
+      const dirLocalX = V.dot(camDir, portalA.right);
+      const dirLocalY = V.dot(camDir, portalA.up);
+      const dirLocalZ = V.dot(camDir, portalA.normal);
+
+      const virtualDir = V.add(
+        V.scale(portalB.right, -dirLocalX),
+        V.add(V.scale(portalB.up, dirLocalY),
+              V.scale(portalB.normal, -dirLocalZ))
+      );
+
+      const virtualTarget = V.add(virtualPos, virtualDir);
+      return M.lookAt(virtualPos, virtualTarget, [0, 1, 0]);
+    };
+
+    const drawPortalQuad = (portal, proj, view) => {
+      // Build model matrix from portal basis vectors
+      const model = new Float32Array([
+        portal.right[0], portal.right[1], portal.right[2], 0,
+        portal.up[0], portal.up[1], portal.up[2], 0,
+        portal.normal[0], portal.normal[1], portal.normal[2], 0,
+        portal.pos[0], portal.pos[1], portal.pos[2], 1
+      ]);
+
+      const mvp = M.mul(M.mul(proj, view), model);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, portalMesh.pos);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, portalMesh.norm);
+      gl.enableVertexAttribArray(aNorm);
+      gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, portalMesh.idx);
+
+      gl.uniformMatrix4fv(uMVP, false, mvp);
+      gl.uniformMatrix4fv(uModel, false, model);
+      gl.uniform3f(uColor, 1, 1, 1);
+      gl.uniform1f(uPortalGlow, 0);
+
+      gl.drawElements(gl.TRIANGLES, portalMesh.count, gl.UNSIGNED_SHORT, 0);
+    };
+
+    const drawPortalOval = (portal, proj, view, color) => {
+      gl.disable(gl.DEPTH_TEST);
+
+      const model = new Float32Array([
+        portal.right[0], portal.right[1], portal.right[2], 0,
+        portal.up[0], portal.up[1], portal.up[2], 0,
+        portal.normal[0], portal.normal[1], portal.normal[2], 0,
+        portal.pos[0], portal.pos[1], portal.pos[2], 1
+      ]);
+
+      const mvp = M.mul(M.mul(proj, view), model);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, portalMesh.pos);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, portalMesh.norm);
+      gl.enableVertexAttribArray(aNorm);
+      gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, portalMesh.idx);
+
+      gl.uniformMatrix4fv(uMVP, false, mvp);
+      gl.uniformMatrix4fv(uModel, false, model);
+      gl.uniform3fv(uColor, color);
+      gl.uniform1f(uPortalGlow, 0.3);
+
+      gl.drawElements(gl.TRIANGLES, portalMesh.count, gl.UNSIGNED_SHORT, 0);
+
+      gl.enable(gl.DEPTH_TEST);
+    };
+
+    const renderPortal = (portalA, portalB, proj, mainView, stencilVal) => {
+      // Step 1: STENCIL PASS - Mark portal shape
+      gl.enable(gl.STENCIL_TEST);
+      gl.stencilFunc(gl.ALWAYS, stencilVal, 0xFF);
+      gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+      gl.colorMask(false, false, false, false);
+      gl.depthMask(false);
+
+      drawPortalQuad(portalA, proj, mainView);
+
+      // Step 2: SCENE PASS - Render through portal
+      gl.colorMask(true, true, true, true);
+      gl.depthMask(true);
+      gl.stencilFunc(gl.EQUAL, stencilVal, 0xFF);
+      gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+      gl.clear(gl.DEPTH_BUFFER_BIT);
+
+      const virtualView = computePortalView(portalA, portalB, cam.pos, getCamDir());
+      drawScene(proj, virtualView);
+
+      // Step 3: DEPTH FILL - Write portal depth
+      gl.colorMask(false, false, false, false);
+      gl.depthMask(true);
+      drawPortalQuad(portalA, proj, mainView);
+
+      // Reset
+      gl.colorMask(true, true, true, true);
+      gl.stencilFunc(gl.ALWAYS, 0, 0xFF);
+    };
+
+    // === RENDERING ===
+    const render = () => {
+      // Clear all buffers
+      gl.clearColor(0.2, 0.2, 0.2, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+      const aspect = canvas.width / canvas.height;
+      const proj = M.persp(cam.fov, aspect, 0.1, 100);
+      const view = getViewMatrix();
+
+      // Phase 1: Render portals (if both active)
+      if (portals.blue && portals.blue.active &&
+          portals.orange && portals.orange.active) {
+        renderPortal(portals.blue, portals.orange, proj, view, 1);
+        renderPortal(portals.orange, portals.blue, proj, view, 2);
+      }
+
+      // Phase 2: Render main scene
+      gl.disable(gl.STENCIL_TEST);
+      drawScene(proj, view);
+
+      // Phase 3: Draw portal ovals
+      if (portals.blue && portals.blue.active) {
+        drawPortalOval(portals.blue, proj, view, [0.3, 0.6, 1.0]);
+      }
+      if (portals.orange && portals.orange.active) {
+        drawPortalOval(portals.orange, proj, view, [1.0, 0.5, 0.1]);
       }
     };
 
